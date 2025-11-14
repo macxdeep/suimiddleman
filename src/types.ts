@@ -42,6 +42,8 @@ export interface IdolCreateRequest {
     launchDate: string;
     launchTime: string;
     countdownMinutes: number;
+    goalMetric: 'supply' | 'reserve' | 'price';
+    goalValue: string;
 }
 
 // New type reflecting the updated return value from checkAndUpdateLevel in SuiBlockchainService

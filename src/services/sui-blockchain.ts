@@ -3,6 +3,7 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction } from '@mysten/sui/transactions';
 import { fromB64 } from '@mysten/sui/utils';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
+import { bcs, fromHex, toHex } from '@mysten/bcs';
 import { Env, IdolCreateRequest, CheckUpdateLevelResult, TradeEventData, IdolMarketCapResult } from '../types';
 import { exec } from 'child_process';
 import fs from 'fs';
@@ -271,6 +272,16 @@ export class SuiBlockchainService {
         },
         createParams: IdolCreateRequest,
     ): Promise<{ digest: string; poolId: string; lpCapId?: string; creatorTokensId?: string; bondingCurveId: string }> {
+        // --- ADDED CONSOLE LOGS ---
+        console.log('[SUI Service] Received request to launch IDOL with the following parameters:');
+        console.log('--- Idol Token Details ---');
+        console.log(JSON.stringify(idolToken, null, 2));
+        console.log('--- Launch Create Params ---');
+        console.log(JSON.stringify(createParams, null, 2));
+        console.log('----------------------------');
+        // --- END OF ADDED CONSOLE LOGS ---
+
+        // --- Step 1: Assert that all required object IDs exist on-chain before building the transaction ---
         await this.assertObjectExists(idolToken.treasuryCapId, 'TreasuryCap');
         await this.assertObjectExists(this.iaoConfigId, 'IAO_CONFIG_ID');
         await this.assertObjectExists(this.iaoRegistryId, 'IAO_REGISTRY_ID');
@@ -278,14 +289,63 @@ export class SuiBlockchainService {
         await this.assertObjectExists(this.poolsRegistryId, 'POOLS_REGISTRY_ID');
         await this.assertObjectExists(this.clockId, 'CLOCK_ID');
 
+        // Add assertion for the newly required Admin Cap ID
+        if (!this.poolsAdminCapId) {
+            throw new Error('POOLS_ADMIN_CAP_ID is not configured. It is required to set the completion level.');
+        }
+        await this.assertObjectExists(this.poolsAdminCapId, 'POOLS_ADMIN_CAP_ID');
+
+
+        // --- Step 2: Build the transaction block ---
         const tx = new Transaction();
-        const [initial_liquidity] = tx.splitCoins(tx.gas, [tx.pure.u64(1_000_000_000)]);
+        const [initial_liquidity] = tx.splitCoins(tx.gas, [tx.pure.u64(150_000_000)]);
         const fullCoinType = idolToken.coinType;
+
+        const metricTypeMap: { [key in IdolCreateRequest['goalMetric']]: number } = {
+            supply: 0,
+            reserve: 1,
+            price: 2,
+        };
+        const metricType = metricTypeMap[createParams.goalMetric];
+        if (metricType === undefined) {
+            throw new Error(`Invalid goalMetric provided: "${createParams.goalMetric}". Must be one of 'supply', 'reserve', or 'price'.`);
+        }
+
+        let goalValueForContract: string;
+
+        switch (createParams.goalMetric) {
+            case 'reserve': {
+                const SUI_TO_MIST_FACTOR = 1_000_000_000;
+                const goalValueInMist = BigInt(createParams.goalValue) * BigInt(SUI_TO_MIST_FACTOR);
+                goalValueForContract = goalValueInMist.toString();
+                console.log(`[SUI Service] Converted 'reserve' goal from ${createParams.goalValue} SUI to ${goalValueForContract} MIST.`);
+                break;
+            }
+            case 'supply': {
+                // The IDOL token has 9 decimals, same as SUI.
+                const TOKEN_DECIMALS_FACTOR = 1_000_000_000;
+                const goalValueInBaseUnits = BigInt(createParams.goalValue) * BigInt(TOKEN_DECIMALS_FACTOR);
+                goalValueForContract = goalValueInBaseUnits.toString();
+                console.log(`[SUI Service] Converted 'supply' goal from ${createParams.goalValue} tokens to ${goalValueForContract} base units.`);
+                break;
+            }
+            case 'price': {
+                // The on-chain price is scaled by 10,000 (BPS).
+                const PRICE_SCALING_FACTOR = 10_000;
+                // We need to handle floating point numbers for price.
+                const goalValueScaled = Math.floor(parseFloat(createParams.goalValue) * PRICE_SCALING_FACTOR);
+                goalValueForContract = goalValueScaled.toString();
+                console.log(`[SUI Service] Converted 'price' goal from ${createParams.goalValue} SUI to scaled integer ${goalValueForContract}.`);
+                break;
+            }
+            default:
+                // Fallback, though the check above should prevent this.
+                goalValueForContract = createParams.goalValue;
+                break;
+        }
 
         const countdown_ms = (createParams.countdownMinutes || 0) * 60 * 1000;
 
-        // --- MODIFICATION START ---
-        // The argument list now matches the updated factory::launch_idol function
         tx.moveCall({
             target: `${this.factoryPackageId}::factory::launch_idol`,
             typeArguments: [fullCoinType],
@@ -293,8 +353,10 @@ export class SuiBlockchainService {
                 tx.pure.string(createParams.name),
                 tx.pure.string(createParams.imageUrl || 'https://idol.fun/default-icon.png'),
                 tx.pure.u64(createParams.totalSupply),
-                tx.pure.u16(createParams.feeRateBps), // Correct argument
-                tx.pure.u64(countdown_ms),            // Correct argument
+                tx.pure.u16(createParams.feeRateBps),
+                tx.pure.u64(countdown_ms),
+                tx.pure.u8(metricType),                 // Pass the goal metric type as a u8
+                tx.pure.u64(goalValueForContract),
                 tx.object(idolToken.treasuryCapId),
                 tx.object(this.iaoConfigId),
                 tx.object(this.iaoRegistryId),
@@ -303,13 +365,14 @@ export class SuiBlockchainService {
                 tx.object(this.cetusConfigId!),
                 tx.object(this.cetusPoolsId!),
                 initial_liquidity,
+                tx.object(this.poolsAdminCapId), // Pass the Admin Cap for authorization
                 tx.object(this.clockId),
             ],
         });
-        // --- MODIFICATION END ---
 
         tx.setGasBudget(100_000_000n);
 
+        // --- Step 3: Pre-flight check with devInspectTransactionBlock ---
         const sender = this.keypair.getPublicKey().toSuiAddress();
         const di = await this.client.devInspectTransactionBlock({
             sender,
@@ -329,6 +392,7 @@ export class SuiBlockchainService {
             throw new Error(`Move abort in preflight: ${error ?? 'unknown error'}`);
         }
 
+        // --- Step 4: Sign and execute the transaction ---
         const result = await this.client.signAndExecuteTransaction({
             signer: this.keypair,
             transaction: tx,
@@ -343,6 +407,7 @@ export class SuiBlockchainService {
 
         console.log('[SUI Service] Full transaction result for launch_idol:', JSON.stringify(result, null, 2));
 
+        // --- Step 5: Extract created object IDs from the transaction result ---
         const createdObjects = result.objectChanges?.filter((o) => o.type === 'created');
         const lpCap = createdObjects?.find((o) => o.objectType.includes('::iao::LPCap'));
         const creatorTokens = createdObjects?.find((o) => o.objectType.includes('::coin::Coin'));
@@ -353,7 +418,6 @@ export class SuiBlockchainService {
             throw new Error('Failed to find Pool object after asset registration.');
         }
 
-        // --- CORRECT METHOD: Find the BondingCurve ID from the event ---
         const events = (result as any).events || [];
         const bondingCurveCreateEvent = events.find((e: any) => e.type.endsWith('::bonding_curve::BondingCurveCreateEvent'));
 
@@ -388,9 +452,6 @@ export class SuiBlockchainService {
         const EVENT_TYPE = `${this.poolsPackageId}::${this.bcModule}::TradeEvent`;
 
         try {
-            // FINAL FIX: Query for the event type directly. This is the most reliable method
-            // as it doesn't depend on which parent object was mutated. We will fetch all
-            // recent trade events and then filter them by bonding_curve_id in our code.
             const eventsResponse = await this.client.queryEvents({
                 query: { MoveEventType: EVENT_TYPE },
                 limit: limit,
@@ -428,7 +489,6 @@ export class SuiBlockchainService {
 
         events.forEach(event => {
             const data = event.parsedJson as TradeEventData;
-            console.log(`[Volume Calculation] Processing event: is_buy=${data.is_buy}, x_amount=${data.x_amount}, y_amount=${data.y_amount}`);
 
             const rawAmountBigInt = BigInt(data.x_amount);
 
@@ -511,8 +571,6 @@ export class SuiBlockchainService {
 
                 // 3. Calculate market cap in SUI
                 const marketCapInSui = priceInSui * circulatingSupply;
-
-                console.log(`[SuiBCService] PRICE_DEBUG for ${coinType}:`, { priceInSui, circulatingSupply, marketCapInSui });
 
                 return {
                     coinType,
@@ -680,7 +738,6 @@ export class SuiBlockchainService {
             typeArguments: [this.quoteCoinType!, idolCoinType],
             arguments: [
                 // Admin Caps & System Objects
-                tx.object(this.poolsAdminCapId),
                 tx.object(this.clockId),
 
                 // Your Protocol's Shared Objects
@@ -707,14 +764,27 @@ export class SuiBlockchainService {
             options: { showEffects: true, showEvents: true },
         });
 
-        const finalResult = await this.client.waitForTransaction({
-            digest: result.digest,
-            options: { showEvents: true }
-        });
+        const status = result.effects?.status.status;
+        if (status !== 'success') {
+            const errorMessage = result.effects?.status.error || 'Unknown error';
+            console.error('[SUI Service] On-chain transaction failed:', errorMessage);
+
+            // Check if the error is the specific one from the `graduate` function's state check.
+            // We look for the function name and module name in the error string.
+            const isInvalidStateError = errorMessage.includes('function_name: Some("graduate")') &&
+                errorMessage.includes('name: Identifier("bonding_curve")');
+
+            if (isInvalidStateError) {
+                throw new Error(`Graduation failed: The IDOL has not met its completion goal yet.`);
+            }
+
+            // For all other errors, throw a generic but informative message.
+            throw new Error(`On-chain transaction failed with status '${status}': ${errorMessage}`);
+        }
 
         return {
-            digest: finalResult.digest,
-            events: (finalResult as any).events ?? []
+            digest: result.digest,
+            events: (result as any).events ?? []
         };
     }
 
@@ -900,6 +970,88 @@ module ${moduleName}::${moduleName} {
         return { state };
     }
 
+    /**
+     * Fetches and parses the LevelManager for a given IDOL's bonding curve.
+     * This provides the completion goal status (metric, trigger value, etc.).
+     * @param idolCoinType - The full coin type of the IDOL token.
+     */
+    async getBondingCurveLevelManager(idolCoinType: string): Promise<any> {
+        if (!this.poolsPackageId || !this.poolsRegistryId) {
+            throw new Error('POOLS_PACKAGE_ID and POOLS_REGISTRY_ID must be configured.');
+        }
+
+        // --- Step 1: Get the Bonding Curve's Object ID from the registry ---
+        const txGetId = new Transaction();
+        txGetId.moveCall({
+            target: `${this.poolsPackageId}::registry::get_bonding_curve_id`,
+            typeArguments: [this.quoteCoinType, idolCoinType],
+            arguments: [txGetId.object(this.poolsRegistryId)],
+        });
+
+        const sender = this.keypair.getPublicKey().toSuiAddress();
+        const devInspectRes = await this.client.devInspectTransactionBlock({ sender, transactionBlock: txGetId });
+
+        const returnValues = devInspectRes?.results?.[0]?.returnValues;
+        if (!returnValues || returnValues.length === 0) {
+            throw new Error(`Could not find a bonding curve for coin type: ${idolCoinType}. DevInspect error: ${devInspectRes?.error}`);
+        }
+
+        const SuiAddress = bcs.bytes(32).transform({
+            input: (val: string) => fromHex(val.startsWith('0x') ? val.substring(2) : val),
+            output: (val) => `0x${toHex(val)}`,
+        });
+
+        const idBytes = new Uint8Array(returnValues[0][0]);
+        const bondingCurveId = SuiAddress.parse(idBytes);
+
+        console.log(`[SUI Service] Found Bonding Curve ID for ${idolCoinType}: ${bondingCurveId}`);
+
+        // --- Step 2: Fetch the Bonding Curve object ---
+        const curveObject = await this.client.getObject({
+            id: bondingCurveId,
+            options: { showContent: true },
+        });
+
+        console.log('[SUI Service] Full Bonding Curve Object:', JSON.stringify(curveObject, null, 2));
+
+        if (curveObject.error || !curveObject.data?.content || curveObject.data.content.dataType !== 'moveObject') {
+            throw new Error(`Failed to fetch content for Bonding Curve object ${bondingCurveId}`);
+        }
+
+        const fields = curveObject.data.content.fields as any;
+        const levelManager = fields.level_manager;
+
+        console.log('[SUI Service] Extracted LevelManager field:', JSON.stringify(levelManager, null, 2));
+
+        // --- Step 3: FINAL PARSING LOGIC ---
+
+        // Safely access curr_level_idx. If it's null, we're done.
+        const currentLevelIndex = levelManager.fields.curr_level_idx === null ? null : levelManager.fields.curr_level_idx;
+
+        const levels = levelManager.fields.levels.map((level: any) => {
+            // The enum variant is a direct property on the trigger_metric object.
+            const triggerMetric = level.fields.trigger_metric.variant;
+
+            const metadataContents = level.fields.metadata?.fields?.contents || [];
+            const metadata = metadataContents.reduce((acc: any, item: any) => {
+                acc[item.fields.key] = item.fields.value;
+                return acc;
+            }, {});
+
+            return {
+                trigger: level.fields.trigger,
+                triggerMetric: triggerMetric,
+                metadata: metadata,
+            };
+        });
+
+        return {
+            bondingCurveId,
+            currentLevelIndex,
+            levels,
+        };
+    }
+
     private parseBondingCurveState(rawReturnValue: any[]): string {
         if (!rawReturnValue || !rawReturnValue.length) {
             return 'Unknown';
@@ -921,3 +1073,4 @@ module ${moduleName}::${moduleName} {
     }
 
 }
+
