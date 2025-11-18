@@ -1,5 +1,3 @@
-//--- File: middleman/src/server.ts ---
-
 import express from 'express';
 import cors from 'cors';
 import { config as dotenvConfig } from 'dotenv';
@@ -11,6 +9,29 @@ dotenvConfig();
 const app = express();
 app.use(express.json());
 app.use(cors());
+
+app.use((req, res, next) => {
+    const start = Date.now();
+    console.log("======================================================");
+    console.log(`[Request] ${new Date().toISOString()}`);
+    console.log(`[Request] ===> ${req.method} ${req.originalUrl}`);
+
+    if (Object.keys(req.query).length > 0) {
+        console.log('[Request] Query:', req.query);
+    }
+    if (req.method !== 'GET' && req.body && Object.keys(req.body).length > 0) {
+        console.log('[Request] Body:', JSON.stringify(req.body, null, 2));
+    }
+    console.log("------------------------------------------------------");
+
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        console.log(`[Request] <=== ${req.method} ${req.originalUrl} - ${res.statusCode} [${duration}ms]`);
+        console.log("======================================================");
+    });
+
+    next();
+});
 
 function parseNetwork(v: string | undefined): SuiNetwork {
     return (NETWORKS as readonly string[]).includes(v ?? '')
@@ -83,6 +104,32 @@ app.get('/current-supply', async (req, res) => {
         res.status(200).json({ coinType, supply });
     } catch (e: any) {
         res.status(500).json({ error: e.message || String(e) });
+    }
+});
+
+app.get('/current-supply-batch', async (req, res) => {
+    try {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        const repeated = url.searchParams.getAll('coinType').filter(Boolean);
+        const csv = (url.searchParams.get('coinTypes') || '').split(',').map(s => s.trim()).filter(Boolean);
+        const coinTypes = Array.from(new Set([...repeated, ...csv]));
+
+        if (coinTypes.length === 0) {
+            return res.status(400).json({ error: 'Missing coinType(s) in query parameters.' });
+        }
+
+        const promises = coinTypes.map(async (coinType) => {
+            try {
+                const { supply } = await suiBlockchainService.getCurrentSupplyForIdol(coinType);
+                return { coinType, supply };
+            } catch (e: any) {
+                return { coinType, error: e.message || String(e) };
+            }
+        });
+        const results = await Promise.all(promises);
+        res.status(200).json({ results });
+    } catch (e: any) {
+        res.status(500).json({ error: e.message || 'Failed to fetch batch current supply' });
     }
 });
 
@@ -328,6 +375,34 @@ app.get('/curve-state', async (req, res) => {
         res.status(200).json({ coinType, state });
     } catch (e: any) {
         res.status(500).json({ error: e.message || String(e) });
+    }
+});
+
+// Read-only: get curve state for a batch of idol coin types
+// Usage: GET /curve-state-batch?coinType=<ID1>&coinType=<ID2>
+app.get('/curve-state-batch', async (req, res) => {
+    try {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        const repeated = url.searchParams.getAll('coinType').filter(Boolean);
+        const csv = (url.searchParams.get('coinTypes') || '').split(',').map(s => s.trim()).filter(Boolean);
+        const coinTypes = Array.from(new Set([...repeated, ...csv]));
+
+        if (coinTypes.length === 0) {
+            return res.status(400).json({ error: 'Missing coinType(s) in query parameters.' });
+        }
+
+        const promises = coinTypes.map(async (coinType) => {
+            try {
+                const { state } = await suiBlockchainService.getCurveStateForIdol(coinType);
+                return { coinType, state };
+            } catch (e: any) {
+                return { coinType, error: e.message || String(e) };
+            }
+        });
+        const results = await Promise.all(promises);
+        res.status(200).json({ results });
+    } catch (e: any) {
+        res.status(500).json({ error: e.message || 'Failed to fetch batch curve states' });
     }
 });
 
