@@ -365,6 +365,48 @@ app.get('/getcurveliquidityreserve', async (req, res) => {
     }
 });
 
+app.get('/getcurveliquidityreserve-batch', async (req, res) => {
+    try {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        const repeated = url.searchParams.getAll('coinType').filter(Boolean);
+        const csv = (url.searchParams.get('coinTypes') || '').split(',').map(s => s.trim()).filter(Boolean);
+        const coinTypes = Array.from(new Set([...repeated, ...csv]));
+
+        if (coinTypes.length === 0) {
+            return res.status(400).json({ error: 'Missing coinType(s) in query parameters.' });
+        }
+
+        console.log(`[DO Droplet] Received batch liquidity reserve request for ${coinTypes.length} coins`);
+
+        const promises = coinTypes.map(async (coinType) => {
+            try {
+                const { rawReturn } = await suiBlockchainService.getCurveLiquidityReserveForIdol(coinType);
+
+                const rawBytes = rawReturn[0][0];
+                const buffer = Buffer.from(rawBytes);
+                const rawLiquidityMist = buffer.readBigUInt64LE(0);
+
+                const MIST_PER_SUI = 1_000_000_000n;
+                const humanReadableLiquidity = Number(rawLiquidityMist) / Number(MIST_PER_SUI);
+
+                return {
+                    coinType,
+                    liquidity_sui: humanReadableLiquidity,
+                    rawReturn: null // reduce payload size for batch
+                };
+            } catch (e: any) {
+                return { coinType, error: e.message || String(e) };
+            }
+        });
+
+        const results = await Promise.all(promises);
+        res.status(200).json({ results });
+    } catch (e: any) {
+        console.error(`[DO Droplet] Batch liquidity reserve error:`, e);
+        res.status(500).json({ error: e.message || 'Failed to fetch batch liquidity reserves' });
+    }
+});
+
 // Read-only: get curve state for a given idol coin type
 // Usage: GET /curve-state?coinType=<PACKAGE::module::STRUCT>
 app.get('/curve-state', async (req, res) => {
