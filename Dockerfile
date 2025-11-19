@@ -14,6 +14,12 @@ ENV PATH="/root/.local/bin:${PATH}"
 # Install Sui CLI (testnet version)
 RUN /bin/bash -c "export PATH=\"$HOME/.local/bin:$PATH\" && suiup install sui@testnet"
 
+# Create symlink to make sui available at /usr/local/bin/sui (commonly expected location)
+RUN ln -s /root/.local/bin/sui /usr/local/bin/sui
+
+# Verify sui installation
+RUN sui --version
+
 # Install pnpm globally
 RUN npm install -g pnpm
 
