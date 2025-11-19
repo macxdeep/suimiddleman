@@ -1,21 +1,19 @@
+# Use Mysten Sui Tools Docker image as base for Sui CLI
+FROM mysten/sui-tools:compat-arm64 AS sui-tools
+
 # Use Node.js 20 LTS as base image
 FROM node:20
 
-# Install curl (required for suiup installation)
+# Install curl (required for suiup installation) - keeping for potential fallback
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-# Install suiup and set up environment
-RUN curl -sSfL https://raw.githubusercontent.com/Mystenlabs/suiup/main/install.sh | sh && \
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-
-# Add Sui binaries to PATH for all sessions
-ENV PATH="/root/.local/bin:${PATH}"
-
-# Install Sui CLI (testnet version)
-RUN /bin/bash -c "export PATH=\"$HOME/.local/bin:$PATH\" && suiup install sui@testnet"
-
-# Create symlink to make sui available at /usr/local/bin/sui (commonly expected location)
-RUN ln -s /root/.local/bin/sui /usr/local/bin/sui
+# Copy Sui tools from the sui-tools image
+COPY --from=sui-tools /usr/local/bin/sui /usr/local/bin/sui
+COPY --from=sui-tools /usr/local/bin/sui-bridge /usr/local/bin/sui-bridge
+COPY --from=sui-tools /usr/local/bin/sui-bridge-cli /usr/local/bin/sui-bridge-cli
+COPY --from=sui-tools /usr/local/bin/sui-cluster-test /usr/local/bin/sui-cluster-test
+COPY --from=sui-tools /usr/local/bin/sui-faucet /usr/local/bin/sui-faucet
+COPY --from=sui-tools /usr/local/bin/sui-tool /usr/local/bin/sui-tool
 
 # Verify sui installation
 RUN sui --version
@@ -41,4 +39,3 @@ EXPOSE 3000
 
 # Run the application with ts-node-dev
 CMD ["pnpm", "run", "dev"]
-
