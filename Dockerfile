@@ -1,41 +1,80 @@
-# Use Mysten Sui Tools Docker image as base for Sui CLI
-FROM mysten/sui-tools:compat-arm64 AS sui-tools
+# ------------------------------------------------------------
+# Base image: Ubuntu 24.04 (GLIBC >= 2.38 → Sui compatible)
+# ------------------------------------------------------------
+FROM ubuntu:24.04
 
-# Use Node.js 20 LTS as base image
-FROM node:20
+# ------------------------------------------------------------
+# Install system dependencies
+# ------------------------------------------------------------
+RUN apt-get update && apt-get install -y \
+    curl \
+    ca-certificates \
+    bash \
+    git \
+    tar \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install curl (required for suiup installation) - keeping for potential fallback
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+# ------------------------------------------------------------
+# Install Node 20 (official binaries)
+# Multi-architecture compatible (amd64 & arm64)
+# ------------------------------------------------------------
+RUN curl -fsSL "https://nodejs.org/dist/v20.11.1/node-v20.11.1-linux-$(dpkg --print-architecture).tar.xz" \
+    -o /tmp/node.tar.xz \
+    && mkdir -p /usr/local/lib/nodejs \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local/lib/nodejs \
+    && rm /tmp/node.tar.xz
 
-# Copy Sui tools from the sui-tools image
-COPY --from=sui-tools /usr/local/bin/sui /usr/local/bin/sui
-COPY --from=sui-tools /usr/local/bin/sui-bridge /usr/local/bin/sui-bridge
-COPY --from=sui-tools /usr/local/bin/sui-bridge-cli /usr/local/bin/sui-bridge-cli
-COPY --from=sui-tools /usr/local/bin/sui-cluster-test /usr/local/bin/sui-cluster-test
-COPY --from=sui-tools /usr/local/bin/sui-faucet /usr/local/bin/sui-faucet
-COPY --from=sui-tools /usr/local/bin/sui-tool /usr/local/bin/sui-tool
+# ------------------------------------------------------------
+# Symlink node/npm/npx so they're available globally
+# ------------------------------------------------------------
+RUN ln -s /usr/local/lib/nodejs/node-*/bin/node /usr/local/bin/node || true \
+ && ln -s /usr/local/lib/nodejs/node-*/bin/npm /usr/local/bin/npm || true \
+ && ln -s /usr/local/lib/nodejs/node-*/bin/npx /usr/local/bin/npx || true
 
-# Verify sui installation
+# ------------------------------------------------------------
+# Install pnpm + symlink it
+# ------------------------------------------------------------
+RUN npm install -g pnpm \
+ && ln -s /usr/local/lib/nodejs/node-*/bin/pnpm /usr/local/bin/pnpm || true
+
+# Verify node tools
+RUN node -v && npm -v && pnpm -v
+
+# ------------------------------------------------------------
+# Install suiup (Sui installer)
+# ------------------------------------------------------------
+RUN curl -sSfL https://raw.githubusercontent.com/MystenLabs/suiup/main/install.sh | sh
+
+# Add suiup bin directory to PATH
+ENV PATH="/root/.local/bin:${PATH}"
+
+# ------------------------------------------------------------
+# Install Sui (testnet) and set default binary
+# ------------------------------------------------------------
+RUN suiup install sui@testnet \
+ && suiup default set sui@testnet
+
+# Verify Sui installation
 RUN sui --version
 
-# Install pnpm globally
-RUN npm install -g pnpm
-
-# Set working directory
+# ------------------------------------------------------------
+# Setup app
+# ------------------------------------------------------------
 WORKDIR /app
 
-# Copy package files
-COPY package.json pnpm-lock.yaml ./
+# Copy dependency files first (cache layer)
+COPY pnpm-lock.yaml package.json ./
 
-# Install dependencies
 RUN pnpm install
 
-# Copy source code
-COPY tsconfig.json ./
-COPY src/ ./src/
+# Copy the rest of your app
+COPY . .
 
-# Expose port 3000 (default, can be overridden via PORT env var)
+# Expose backend port
 EXPOSE 3000
 
-# Run the application with ts-node-dev
-CMD ["pnpm", "run", "dev"]
+# ------------------------------------------------------------
+# Run dev server (ts-node-dev)
+# ------------------------------------------------------------
+CMD ["pnpm", "dev"]
