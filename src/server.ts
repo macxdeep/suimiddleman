@@ -1,4 +1,5 @@
 import express from 'express';
+import { exec } from 'child_process';
 import cors from 'cors';
 import { config as dotenvConfig } from 'dotenv';
 import { SuiBlockchainService } from './services/sui-blockchain';
@@ -77,7 +78,24 @@ for (const key of requiredEnv) {
 const suiBlockchainService = new SuiBlockchainService(env);
 
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'ok', message: 'SUI Blockchain Service is running' });
+    exec('sui --version', (error, stdout, stderr) => {
+        if (error) {
+            console.error(`[Health Check] Error checking sui version: ${error.message}`);
+            return res.status(503).json({
+                status: 'error',
+                message: 'Sui binary not found or not executable',
+                details: error.message
+            });
+        }
+        if (stderr) {
+            console.warn(`[Health Check] Sui version check stderr: ${stderr}`);
+        }
+        res.status(200).json({
+            status: 'ok',
+            message: 'SUI Blockchain Service is running',
+            suiVersion: stdout.trim()
+        });
+    });
 });
 
 app.get('/marginal-price', async (req, res) => {
