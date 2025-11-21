@@ -2,7 +2,6 @@
 # Base image: Ubuntu 24.04 (GLIBC ≥ 2.38 → Sui compatible)
 # ------------------------------------------------------------
 FROM ubuntu:24.04
-
 # ------------------------------------------------------------
 # Install system dependencies
 # ------------------------------------------------------------
@@ -55,6 +54,23 @@ RUN suiup install sui@testnet \
  && suiup default set sui@testnet
 
 RUN sui --version
+
+# Symlink so sui is available globally
+RUN ln -s /root/.local/bin/sui /usr/local/bin/sui
+
+# ------------------------------------------------------------
+# Initialize Sui client non-interactively (auto-generate keys + config)
+# ------------------------------------------------------------
+RUN mkdir -p /root/.sui/sui_config
+
+# Provide answers:
+# 1. y  → create new config
+# 2. "" → blank fullnode URL (defaults to testnet)
+# 3. 0  → Ed25519 key scheme
+RUN printf "y\n\n0\n" | sui client active-address || true
+
+# Optional: print the generated address during build
+RUN sui client active-address
 
 # ------------------------------------------------------------
 # App setup
